@@ -1,6 +1,9 @@
 name: Build PR 7433 self-test frontend image
 
 "on":
+  push:
+    branches: [codex/build-pr7433-selftest]
+    paths: [.github/workflows/frontend.yml]
   workflow_dispatch:
     inputs:
       module:
@@ -30,25 +33,44 @@ permissions:
   contents: read
 
 jobs:
+  select-modules:
+    if: github.repository == 'norberia/sealos'
+    runs-on: ubuntu-24.04
+    outputs:
+      modules: ${{ steps.modules.outputs.modules }}
+    steps:
+      - id: modules
+        env:
+          EVENT: ${{ github.event_name }}
+          MODULE: ${{ inputs.module }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            echo 'modules=["desktop","providers/costcenter","providers/license"]' >> "$GITHUB_OUTPUT"
+          else
+            case "$MODULE" in
+              desktop|providers/costcenter|providers/license) ;;
+              *) exit 1 ;;
+            esac
+            echo "modules=$(jq -cn --arg module "$MODULE" '[$module]')" >> "$GITHUB_OUTPUT"
+          fi
+
   image-build:
+    needs: select-modules
     if: github.repository == 'norberia/sealos'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+        module: ${{ fromJSON(needs.select-modules.outputs.modules) }}
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     permissions:
       contents: read
       packages: write
     steps:
       - name: Validate scope
         env:
-          MODULE: ${{ inputs.module }}
-          TAG: ${{ inputs.push_image_tag }}
+          MODULE: ${{ matrix.module }}
+          TAG: ${{ inputs.push_image_tag || env.SELFTEST_TAG }}
           OWNER: ${{ github.repository_owner }}
         run: |
           test "$OWNER" = norberia
@@ -76,7 +98,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to personal GHCR
-        if: inputs.push_image
+        if: github.event_name == 'push' || inputs.push_image
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -92,12 +114,12 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           build-args: |
             name=${{ env.MODULE_NAME }}
-            path=${{ inputs.module }}
+            path=${{ matrix.module }}
           labels: |
             org.opencontainers.image.source=https://github.com/norberia/sealos
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
             org.opencontainers.image.version=${{ env.SELFTEST_TAG }}
-          outputs: type=image,name=${{ env.GHCR_REPO }},push-by-digest=true,name-canonical=true,push=${{ inputs.push_image }}
+          outputs: type=image,name=${{ env.GHCR_REPO }},push-by-digest=true,name-canonical=true,push=${{ github.event_name == 'push' || inputs.push_image }}
 
       - name: Export architecture digest
         env:
@@ -116,8 +138,12 @@ jobs:
 
   image-release:
     name: Publish dedicated self-test manifest
-    if: github.repository == 'norberia/sealos' && inputs.push_image
-    needs: image-build
+    if: github.repository == 'norberia/sealos' && (github.event_name == 'push' || inputs.push_image)
+    needs: [select-modules, image-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.select-modules.outputs.modules) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -125,8 +151,8 @@ jobs:
     steps:
       - name: Set image identity
         env:
-          MODULE: ${{ inputs.module }}
-          TAG: ${{ inputs.push_image_tag }}
+          MODULE: ${{ matrix.module }}
+          TAG: ${{ inputs.push_image_tag || env.SELFTEST_TAG }}
         run: |
           test "$TAG" = "$SELFTEST_TAG"
           case "$MODULE" in
